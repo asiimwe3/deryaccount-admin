@@ -1,10 +1,11 @@
 /* DeryAccount Admin — connection settings.
  *
- * Fill these from Supabase → Project Settings → API, then redeploy.
- * Use ONLY the anon (publishable) key. This file is public: a service_role key
- * here would hand the whole database to anyone who opens the page.
+ * Project: DeryAccount (eu-central-1), Supabase ref hejyndudxtinigbvzolj.
+ * Only the anon (publishable) key belongs here: this file is public. Uploads are
+ * accepted only through the ingest_sales() function, which requires a device
+ * token, so the anon key alone cannot write or forge a sale.
  */
 window.DERY_CONFIG = {
-  supabaseUrl: '',        // e.g. https://abcdefgh.supabase.co
-  supabaseAnonKey: ''     // the long "anon public" key
+  supabaseUrl: "https://hejyndudxtinigbvzolj.supabase.co",
+  supabaseAnonKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhlanluZHVkeHRpbmlnYnZ6b2xqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTM2Mzc2MjEsImV4cCI6MjEwOTIxMzYyMX0.9YZBVsPtUdIbXfaP0LPXLrH9t6lzvRJuJxP2CTs_d3Q"
 };
