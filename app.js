@@ -1,205 +1,352 @@
-/* DeryAccount Admin — owner dashboard.
- * Reads the tables the Android/desktop sync engine already pushes.
- * No data is ever written from the browser; this screen is read-only.
+/* DeryAccount Admin — owner dashboard (read-only).
+ *
+ * Data comes from Supabase, uploaded by the tills. This file never writes to
+ * sales: it only reads. Local books on each till remain authoritative.
+ *
+ * Time: every "day" is a Uganda day (Africa/Kampala, UTC+3, no DST). A sale at
+ * 00:30 in Kampala belongs to that day, not the previous UTC day.
  */
 (function () {
-  const cfg = window.DERY_CONFIG || {};
-  const root = document.getElementById("app");
-  let sb = null, profile = null, branches = [], state = { days: 7, branch: "ALL" };
+  'use strict';
 
-  const money = (n) =>
-    "UGX " + (Number(n) || 0).toLocaleString("en-UG", { maximumFractionDigits: 0 });
-  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  var TZ = 'Africa/Kampala';
+  var sb = null;
+  var state = {
+    rows: [],
+    branches: [],
+    staff: {},
+    devices: [],
+    filter: { branch: 'ALL', platform: 'ALL', days: 7 },
+    loading: false,
+    error: null,
+    loadedAt: null
+  };
 
+  var el = document.getElementById('app');
+
+  // ── helpers ───────────────────────────────────────────────────────────────
   function configured() {
-    return !!(cfg.supabaseUrl && cfg.supabaseAnonKey);
+    return !!(window.DERY_CONFIG && window.DERY_CONFIG.supabaseUrl && window.DERY_CONFIG.supabaseAnonKey);
   }
 
-  function shell(inner) {
-    root.innerHTML =
-      '<div class="topbar"><div class="brand"><span class="dot"></span>DeryAccount <b>Admin</b></div>' +
-      (profile ? '<div class="who">' + esc(profile.email || "") +
-        ' <button id="out" class="ghost">Sign out</button></div>' : "") +
-      "</div><main>" + inner + "</main>";
-    const out = document.getElementById("out");
-    if (out) out.onclick = async () => { await sb.auth.signOut(); profile = null; render(); };
-  }
-
-  function setupScreen() {
-    shell(
-      '<section class="card"><h1>Connect the database</h1>' +
-      "<p>This dashboard reads the sales your phones and desktops push to Supabase. " +
-      "Open <code>config.js</code> and paste the project URL and the <b>anon</b> key from " +
-      "Supabase &rarr; Project Settings &rarr; API, then reload.</p>" +
-      '<p class="muted">Never paste the service_role key here.</p></section>'
-    );
-  }
-
-  function loginScreen() {
-    shell(
-      '<section class="card narrow"><h1>Owner sign in</h1>' +
-      '<p class="muted">The same account you use to manage the business.</p>' +
-      '<label>Email<input id="em" type="email" autocomplete="username"></label>' +
-      '<label>Password<input id="pw" type="password" autocomplete="current-password"></label>' +
-      '<button id="go" class="primary">Sign in</button>' +
-      '<p id="err" class="err"></p></section>'
-    );
-    document.getElementById("go").onclick = async () => {
-      const em = document.getElementById("em").value.trim();
-      const pw = document.getElementById("pw").value;
-      const err = document.getElementById("err");
-      err.textContent = "";
-      const { error } = await sb.auth.signInWithPassword({ email: em, password: pw });
-      if (error) { err.textContent = error.message; return; }
-      await boot();
-    };
-  }
-
-  async function loadProfile() {
-    const { data: userData } = await sb.auth.getUser();
-    if (!userData || !userData.user) return null;
-    const { data } = await sb.from("profiles").select("org_id,email,role").eq("id", userData.user.id).maybeSingle();
-    if (!data) {
-      return { email: userData.user.email, org_id: null, role: null, missing: true };
-    }
-    return { email: data.email || userData.user.email, org_id: data.org_id, role: data.role };
-  }
-
-  async function loadBranches() {
-    const { data } = await sb.from("branches").select("id,name").order("name");
-    branches = data || [];
-  }
-
-  function sinceIso(days) {
-    const d = new Date();
-    d.setHours(0, 0, 0, 0);
-    d.setDate(d.getDate() - (days - 1));
-    return d.toISOString();
-  }
-
-  async function loadSales() {
-    let q = sb.from("sales")
-      .select("id,receiptNo,total,taxTotal,discount,paymentMethod,createdAt,branchId,platform,isDeleted")
-      .gte("createdAt", sinceIso(state.days))
-      .eq("isDeleted", false)
-      .order("createdAt", { ascending: false })
-      .limit(500);
-    if (state.branch !== "ALL") q = q.eq("branchId", state.branch);
-    const { data, error } = await q;
-    if (error) throw error;
-    return data || [];
-  }
-
-  function groupByDay(rows, days) {
-    const map = new Map();
-    for (let i = 0; i < days; i++) {
-      const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - i);
-      map.set(d.toISOString().slice(0, 10), 0);
-    }
-    rows.forEach((r) => {
-      const k = new Date(r.createdAt).toISOString().slice(0, 10);
-      if (map.has(k)) map.set(k, map.get(k) + Number(r.total || 0));
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
-    return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0]));
   }
 
-  function bars(series) {
-    const max = Math.max(1, ...series.map((s) => s[1]));
-    return '<div class="bars">' + series.map(([day, v]) =>
-      '<div class="bar" title="' + day + ": " + money(v) + '">' +
-      '<i style="height:' + Math.round((v / max) * 100) + '%"></i></div>').join("") + "</div>";
+  // Uganda-local calendar day for an instant, as YYYY-MM-DD.
+  function localDay(d) {
+    var parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit'
+    }).formatToParts(d);
+    var o = {};
+    parts.forEach(function (p) { o[p.type] = p.value; });
+    return o.year + '-' + o.month + '-' + o.day;
   }
 
-  async function dashboard() {
-    let rows = [];
-    let failed = "";
-    try { rows = await loadSales(); } catch (e) { failed = e.message || String(e); }
+  function dayOffset(n) {
+    var d = new Date();
+    d.setUTCDate(d.getUTCDate() - n);
+    return localDay(d);
+  }
 
-    const todayKey = new Date().toISOString().slice(0, 10);
-    const today = rows.filter((r) => new Date(r.createdAt).toISOString().slice(0, 10) === todayKey);
-    const total = rows.reduce((a, r) => a + Number(r.total || 0), 0);
-    const vat = rows.reduce((a, r) => a + Number(r.taxTotal || 0), 0);
-    const android = rows.filter((r) => (r.platform || "android") === "android").length;
-    const desktop = rows.filter((r) => r.platform === "desktop").length;
+  // Start of a Uganda day, as a UTC instant (Kampala = UTC+3, fixed).
+  function dayStartUtc(dayStr) {
+    return new Date(dayStr + 'T00:00:00+03:00');
+  }
 
-    const branchOptions = ['<option value="ALL">All branches</option>'].concat(
-      branches.map((b) => '<option value="' + esc(b.id) + '"' +
-        (state.branch === b.id ? " selected" : "") + ">" + esc(b.name || b.id) + "</option>")
-    ).join("");
+  function money(n) {
+    var v = Number(n || 0);
+    return 'UGX ' + v.toLocaleString('en-UG', { maximumFractionDigits: 0 });
+  }
 
-    shell(
-      '<section class="filters">' +
-      '<select id="branch">' + branchOptions + "</select>" +
-      [7, 30, 90].map((d) => '<button class="chip' + (state.days === d ? " on" : "") +
-        '" data-days="' + d + '">Last ' + d + " days</button>").join("") +
-      '<button id="csv" class="ghost">Export CSV</button></section>' +
-      (failed ? '<section class="card err">Could not read sales: ' + esc(failed) + "</section>" : "") +
-      '<section class="kpis">' +
-      kpi("Today", money(today.reduce((a, r) => a + Number(r.total || 0), 0)), today.length + " tickets") +
-      kpi("Last " + state.days + " days", money(total), rows.length + " tickets") +
-      kpi("VAT collected", money(vat), "included in totals") +
-      kpi("Devices", android + " phone", desktop + " desktop") +
-      "</section>" +
-      '<section class="card"><h2>Daily sales</h2>' + bars(groupByDay(rows, state.days)) + "</section>" +
-      '<section class="card"><h2>Recent sales</h2><div class="tablewrap"><table><thead><tr>' +
-      "<th>Time</th><th>Receipt</th><th>Branch</th><th>Device</th><th>Payment</th><th class=\"r\">Total</th>" +
-      "</tr></thead><tbody>" +
-      (rows.slice(0, 100).map((r) =>
-        "<tr><td>" + new Date(r.createdAt).toLocaleString() + "</td><td>" + esc(r.receiptNo) +
-        "</td><td>" + esc(branchName(r.branchId)) + "</td><td>" + esc(r.platform || "android") +
-        "</td><td>" + esc(r.paymentMethod) + '</td><td class="r">' + money(r.total) + "</td></tr>"
-      ).join("") || '<tr><td colspan="6" class="muted">No sales in this period yet.</td></tr>') +
-      "</tbody></table></div></section>"
-    );
+  function stamp(iso) {
+    if (!iso) return '—';
+    var d = new Date(iso);
+    if (isNaN(d)) return '—';
+    return new Intl.DateTimeFormat('en-GB', {
+      timeZone: TZ, day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit'
+    }).format(d);
+  }
 
-    document.getElementById("branch").onchange = (e) => { state.branch = e.target.value; dashboard(); };
-    document.querySelectorAll("[data-days]").forEach((b) => {
-      b.onclick = () => { state.days = Number(b.dataset.days); dashboard(); };
+  function ago(iso) {
+    if (!iso) return 'never';
+    var mins = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return mins + ' min ago';
+    var hrs = Math.round(mins / 60);
+    if (hrs < 24) return hrs + ' h ago';
+    return Math.round(hrs / 24) + ' d ago';
+  }
+
+  // ── data ──────────────────────────────────────────────────────────────────
+  function filtered() {
+    var since = dayStartUtc(dayOffset(state.filter.days - 1));
+    return state.rows.filter(function (r) {
+      var t = new Date(r.sold_at || r.created_at || 0);
+      if (isNaN(t) || t < since) return false;
+      if (state.filter.branch !== 'ALL' && r.branch_id !== state.filter.branch) return false;
+      if (state.filter.platform !== 'ALL' && (r.platform || 'unknown') !== state.filter.platform) return false;
+      return true;
     });
-    document.getElementById("csv").onclick = () => exportCsv(rows);
   }
 
-  function kpi(label, value, sub) {
-    return '<div class="card kpi"><span>' + esc(label) + "</span><b>" + esc(value) +
-      "</b><small>" + esc(sub) + "</small></div>";
+  function totals(rows) {
+    var t = { revenue: 0, vat: 0, discount: 0, tickets: rows.length };
+    rows.forEach(function (r) {
+      t.revenue += Number(r.total || 0);
+      t.vat += Number(r.tax_total || 0);
+      t.discount += Number(r.discount || 0);
+    });
+    return t;
+  }
+
+  function byDay(rows) {
+    var map = {};
+    rows.forEach(function (r) {
+      var d = localDay(new Date(r.sold_at || r.created_at));
+      if (!map[d]) map[d] = { day: d, revenue: 0, tickets: 0 };
+      map[d].revenue += Number(r.total || 0);
+      map[d].tickets += 1;
+    });
+    var out = [];
+    for (var i = state.filter.days - 1; i >= 0; i--) {
+      var d = dayOffset(i);
+      out.push(map[d] || { day: d, revenue: 0, tickets: 0 });
+    }
+    return out;
+  }
+
+  function load() {
+    state.loading = true;
+    state.error = null;
+    render();
+
+    var since = new Date(Date.now() - 100 * 24 * 3600 * 1000).toISOString();
+    Promise.all([
+      sb.from('sales').select('*').gte('sold_at', since).order('sold_at', { ascending: false }).limit(20000),
+      sb.from('branches').select('id,name,code'),
+      sb.from('staff').select('id,name'),
+      sb.from('devices').select('id,name,platform,branch_id,last_sync_at,last_seen_at')
+    ]).then(function (res) {
+      var err = res[0].error || res[1].error;
+      if (err) throw err;
+      state.rows = res[0].data || [];
+      state.branches = res[1].data || [];
+      state.staff = {};
+      (res[2].data || []).forEach(function (s) { state.staff[s.id] = s.name; });
+      state.devices = res[3].data || [];
+      state.loadedAt = new Date().toISOString();
+      state.loading = false;
+      render();
+    }).catch(function (e) {
+      state.error = (e && e.message) ? e.message : 'Could not reach the database.';
+      state.loading = false;
+      render();
+    });
+  }
+
+  function csv() {
+    var rows = filtered();
+    var head = ['receipt_no', 'sold_at_kampala', 'branch', 'platform', 'cashier', 'payment_method',
+      'subtotal', 'vat', 'discount', 'total', 'amount_paid', 'change_given', 'status'];
+    var lines = [head.join(',')];
+    rows.forEach(function (r) {
+      var vals = [
+        r.receipt_no || '', stamp(r.sold_at || r.created_at),
+        branchName(r.branch_id), r.platform || '', state.staff[r.user_id] || r.user_id || '',
+        r.payment_method || '', r.subtotal, r.tax_total, r.discount, r.total,
+        r.amount_paid, r.change_given, r.status || ''
+      ];
+      lines.push(vals.map(function (v) {
+        var s = String(v == null ? '' : v);
+        return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+      }).join(','));
+    });
+    var blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'deryaccount-sales-' + dayOffset(0) + '.csv';
+    a.click();
+    URL.revokeObjectURL(a.href);
   }
 
   function branchName(id) {
-    const b = branches.find((x) => x.id === id);
-    return b ? (b.name || b.id) : (id || "");
-  }
-
-  function exportCsv(rows) {
-    const head = ["createdAt", "receiptNo", "branch", "platform", "paymentMethod", "total", "taxTotal", "discount"];
-    const body = rows.map((r) => [r.createdAt, r.receiptNo, branchName(r.branchId), r.platform || "android",
-      r.paymentMethod, r.total, r.taxTotal, r.discount].map((v) =>
-      '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"').join(","));
-    const blob = new Blob([[head.join(",")].concat(body).join("\n")], { type: "text/csv" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "deryaccount-sales.csv";
-    a.click();
-  }
-
-  async function boot() {
-    profile = await loadProfile();
-    if (!profile) { loginScreen(); return; }
-    if (profile.missing) {
-      shell('<section class="card"><h1>Almost there</h1><p>Your login works but no business is ' +
-        "linked to it yet. Add a row to <code>profiles</code> with your user id and the org id, " +
-        "then reload.</p></section>");
-      return;
+    for (var i = 0; i < state.branches.length; i++) {
+      if (state.branches[i].id === id) return state.branches[i].name || id;
     }
-    await loadBranches();
-    await dashboard();
+    return id || '—';
+  }
+
+  // ── views ─────────────────────────────────────────────────────────────────
+  function setupScreen() {
+    el.innerHTML = '' +
+      '<div class="center"><div class="card narrow">' +
+      '<h1>Connect the database</h1>' +
+      '<p>This dashboard is live but not yet pointed at a Supabase project.</p>' +
+      '<ol>' +
+      '<li>Create a Supabase project.</li>' +
+      '<li>SQL editor: run <code>supabase/schema.sql</code>.</li>' +
+      '<li>Project Settings → API: copy the URL and the <b>anon</b> key.</li>' +
+      '<li>Put both into <code>config.js</code> and redeploy.</li>' +
+      '</ol>' +
+      '<p class="muted">Never put the service_role key here. This file is public.</p>' +
+      '</div></div>';
+  }
+
+  function loginScreen(message) {
+    el.innerHTML = '' +
+      '<div class="center"><form class="card narrow" id="login">' +
+      '<h1>DeryAccount Admin</h1>' +
+      '<p class="muted">Sign in with your owner account.</p>' +
+      (message ? '<p class="error">' + esc(message) + '</p>' : '') +
+      '<label>Email<input type="email" id="email" autocomplete="username" required></label>' +
+      '<label>Password<input type="password" id="password" autocomplete="current-password" required></label>' +
+      '<button type="submit">Sign in</button>' +
+      '</form></div>';
+    document.getElementById('login').addEventListener('submit', function (e) {
+      e.preventDefault();
+      var email = document.getElementById('email').value.trim();
+      var pass = document.getElementById('password').value;
+      sb.auth.signInWithPassword({ email: email, password: pass }).then(function (r) {
+        if (r.error) loginScreen(r.error.message);
+        else load();
+      });
+    });
+  }
+
+  function chart(days) {
+    var max = Math.max.apply(null, days.map(function (d) { return d.revenue; }).concat([1]));
+    var bars = days.map(function (d) {
+      var h = Math.round((d.revenue / max) * 100);
+      return '<div class="bar-wrap" title="' + esc(d.day) + ': ' + esc(money(d.revenue)) + '">' +
+        '<div class="bar" style="height:' + Math.max(h, 2) + '%"></div>' +
+        '<span>' + esc(d.day.slice(8)) + '</span></div>';
+    }).join('');
+    return '<div class="chart">' + bars + '</div>';
+  }
+
+  function syncPanel() {
+    if (!state.devices.length) {
+      return '<div class="card"><h3>Devices</h3><p class="muted">No till has synced yet. ' +
+        'Register a device in Supabase and add its token in the app settings.</p></div>';
+    }
+    var rows = state.devices.map(function (d) {
+      var stale = !d.last_sync_at || (Date.now() - new Date(d.last_sync_at).getTime()) > 24 * 3600 * 1000;
+      return '<tr><td>' + esc(d.name || d.id) + '</td><td>' + esc(d.platform || '—') + '</td>' +
+        '<td>' + esc(branchName(d.branch_id)) + '</td>' +
+        '<td class="' + (stale ? 'warn' : 'ok') + '">' + esc(ago(d.last_sync_at)) + '</td></tr>';
+    }).join('');
+    return '<div class="card"><h3>Devices</h3><table class="mini">' +
+      '<thead><tr><th>Till</th><th>Platform</th><th>Branch</th><th>Last sync</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody></table></div>';
+  }
+
+  function dashboard() {
+    var rows = filtered();
+    var t = totals(rows);
+    var android = rows.filter(function (r) { return r.platform === 'android'; });
+    var desktop = rows.filter(function (r) { return r.platform === 'desktop'; });
+
+    var branchOpts = ['<option value="ALL">All branches</option>'].concat(
+      state.branches.map(function (b) {
+        return '<option value="' + esc(b.id) + '"' + (state.filter.branch === b.id ? ' selected' : '') + '>' +
+          esc(b.name || b.id) + '</option>';
+      })).join('');
+
+    var recent = rows.slice(0, 40).map(function (r) {
+      return '<tr><td>' + esc(r.receipt_no || '—') + '</td>' +
+        '<td>' + esc(stamp(r.sold_at || r.created_at)) + '</td>' +
+        '<td>' + esc(branchName(r.branch_id)) + '</td>' +
+        '<td>' + esc(r.platform || '—') + '</td>' +
+        '<td>' + esc(state.staff[r.user_id] || r.user_id || '—') + '</td>' +
+        '<td>' + esc(r.payment_method || '—') + '</td>' +
+        '<td class="num">' + esc(money(r.total)) + '</td></tr>';
+    }).join('');
+
+    el.innerHTML = '' +
+      '<header class="topbar">' +
+      '<div><strong>DeryAccount</strong> <span class="muted">Admin</span></div>' +
+      '<div class="right">' +
+      '<span class="muted" id="synced">' + (state.loadedAt ? 'Updated ' + esc(ago(state.loadedAt)) : '') + '</span>' +
+      '<button class="ghost" id="refresh">Refresh</button>' +
+      '<button class="ghost" id="logout">Sign out</button>' +
+      '</div></header>' +
+
+      '<div class="filters">' +
+      '<select id="days">' + [1, 7, 30, 90].map(function (d) {
+        return '<option value="' + d + '"' + (state.filter.days === d ? ' selected' : '') + '>Last ' + d + ' day' + (d > 1 ? 's' : '') + '</option>';
+      }).join('') + '</select>' +
+      '<select id="branch">' + branchOpts + '</select>' +
+      '<select id="platform">' + ['ALL', 'android', 'desktop'].map(function (p) {
+        return '<option value="' + p + '"' + (state.filter.platform === p ? ' selected' : '') + '>' +
+          (p === 'ALL' ? 'All tills' : p === 'android' ? 'Android' : 'Desktop') + '</option>';
+      }).join('') + '</select>' +
+      '<button class="ghost" id="export">Export CSV</button>' +
+      '</div>' +
+
+      (state.error ? '<div class="banner error">' + esc(state.error) + ' <button class="ghost" id="retry">Retry</button></div>' : '') +
+
+      '<div class="kpis">' +
+      kpi('Revenue', money(t.revenue)) +
+      kpi('VAT collected', money(t.vat)) +
+      kpi('Discounts', money(t.discount)) +
+      kpi('Tickets', String(t.tickets)) +
+      '</div>' +
+
+      '<div class="grid">' +
+      '<div class="card"><h3>Daily sales</h3>' + chart(byDay(rows)) + '</div>' +
+      '<div class="card"><h3>Till split</h3>' +
+      '<p>Android <b>' + esc(money(totals(android).revenue)) + '</b> · ' + android.length + ' tickets</p>' +
+      '<p>Desktop <b>' + esc(money(totals(desktop).revenue)) + '</b> · ' + desktop.length + ' tickets</p>' +
+      '<p class="muted">All amounts include VAT; VAT shown separately above.</p>' +
+      '</div></div>' +
+
+      syncPanel() +
+
+      '<div class="card"><h3>Recent sales</h3>' +
+      (rows.length ? '<table><thead><tr><th>Receipt</th><th>When</th><th>Branch</th><th>Till</th><th>Cashier</th><th>Payment</th><th class="num">Total</th></tr></thead><tbody>' + recent + '</tbody></table>'
+        : '<p class="muted">No sales in this period yet. Sales appear here after a till syncs.</p>') +
+      '</div>' +
+
+      '<p class="muted foot">Read-only view. Selling and accounting stay on the tills.</p>';
+
+    document.getElementById('refresh').onclick = load;
+    document.getElementById('logout').onclick = function () { sb.auth.signOut().then(function () { render(); }); };
+    document.getElementById('export').onclick = csv;
+    document.getElementById('days').onchange = function (e) { state.filter.days = Number(e.target.value); render(); };
+    document.getElementById('branch').onchange = function (e) { state.filter.branch = e.target.value; render(); };
+    document.getElementById('platform').onchange = function (e) { state.filter.platform = e.target.value; render(); };
+    var retry = document.getElementById('retry');
+    if (retry) retry.onclick = load;
+  }
+
+  function kpi(label, value) {
+    return '<div class="card kpi"><span class="muted">' + esc(label) + '</span><strong>' + esc(value) + '</strong></div>';
   }
 
   function render() {
-    if (!configured()) { setupScreen(); return; }
-    sb = window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseAnonKey);
-    sb.auth.getSession().then(({ data }) => { if (data && data.session) boot(); else loginScreen(); });
+    if (!configured()) return setupScreen();
+    if (state.loading && !state.rows.length) {
+      el.innerHTML = '<div class="center"><div class="card narrow"><div class="spinner"></div><p>Loading your sales…</p></div></div>';
+      return;
+    }
+    dashboard();
   }
 
-  render();
+  // ── boot ──────────────────────────────────────────────────────────────────
+  function boot() {
+    if (!configured()) return render();
+    sb = window.supabase.createClient(window.DERY_CONFIG.supabaseUrl, window.DERY_CONFIG.supabaseAnonKey);
+    sb.auth.getSession().then(function (r) {
+      if (r.data && r.data.session) load();
+      else loginScreen();
+    });
+    sb.auth.onAuthStateChange(function (_e, session) {
+      if (!session) loginScreen();
+    });
+  }
+
+  boot();
 })();

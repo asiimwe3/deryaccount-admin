@@ -1,11 +1,10 @@
 /* DeryAccount Admin — connection settings.
  *
- * Fill these from Supabase → Project Settings → API once the project exists.
- * The anon key is safe to ship: every table is protected by row level security,
- * so an anonymous visitor can read nothing. NEVER put the service_role key here.
+ * Fill these from Supabase → Project Settings → API, then redeploy.
+ * Use ONLY the anon (publishable) key. This file is public: a service_role key
+ * here would hand the whole database to anyone who opens the page.
  */
 window.DERY_CONFIG = {
-  supabaseUrl: "",
-  supabaseAnonKey: "",
-  businessName: "DeryAccount"
+  supabaseUrl: '',        // e.g. https://abcdefgh.supabase.co
+  supabaseAnonKey: ''     // the long "anon public" key
 };
