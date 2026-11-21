@@ -110,8 +110,11 @@ create table if not exists sales (
   shift_id        text,
   created_at      timestamptz,
   updated_at      timestamptz,
-  received_at     timestamptz not null default now(),   -- when the cloud got it
-  unique (branch_id, receipt_no)
+  received_at     timestamptz not null default now()    -- when the cloud got it
+  -- Deliberately NO unique(branch_id, receipt_no): a shop that resets its daily
+  -- counter would otherwise have every later sale silently rejected on upload.
+  -- Idempotency comes from the primary key (the till's own UUID) plus
+  -- Prefer: resolution=merge-duplicates.
 );
 
 create index if not exists sales_sold_at_idx on sales(sold_at desc);
